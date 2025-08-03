@@ -1,12 +1,16 @@
-Here's the complete README with the global installation instructions included:
+Here's the updated README reflecting all the latest enhancements to the WinRDP script:
 
 # WinRDP - Remote Desktop Connection Script
 
-A lightweight bash script for establishing RDP connections to Windows machines using `xfreerdp` with enhanced features and background execution capabilities.
+A robust bash script for establishing RDP connections to Windows machines using `xfreerdp` with comprehensive input validation, retry logic, and enhanced error handling.
 
 ## Features
 
-- **Interactive Input**: Prompts for connection parameters
+- **Comprehensive Input Validation**: Validates IP addresses, hostnames, port numbers, and connectivity
+- **Unified Retry Logic**: Re-enter all inputs when any validation fails for consistent user experience
+- **Host Connectivity Testing**: Multi-method connectivity verification (netcat, telnet, bash TCP)
+- **Credential Pre-validation**: Tests RDP authentication before launching GUI
+- **Interactive Input**: Prompts for missing connection parameters
 - **Flexible Port Configuration**: Supports custom RDP ports (default: 3389)
 - **Audio Support**: Optional audio and microphone redirection
 - **Multi-Monitor Support**: Connect across multiple displays
@@ -15,6 +19,7 @@ A lightweight bash script for establishing RDP connections to Windows machines u
 - **Certificate Handling**: Automatically accepts untrusted certificates
 - **System Logging**: Debug output via system logger
 - **Performance Optimized**: Graphics acceleration and compression
+- **Help System**: Built-in help with usage examples
 
 ## Prerequisites
 
@@ -23,23 +28,24 @@ A lightweight bash script for establishing RDP connections to Windows machines u
   - `xfreerdp` (FreeRDP client)
   - `bash` (version 4.0+)
   - `logger` (for system logging)
+  - `nc` (netcat) or `telnet` (for connectivity testing - optional but recommended)
 
 ### Installing Dependencies
 
 **Ubuntu/Debian:**
 ```bash
 sudo apt update
-sudo apt install freerdp2-x11
+sudo apt install freerdp2-x11 netcat-openbsd
 ```
 
 **RHEL/CentOS/Fedora:**
 ```bash
-sudo dnf install freerdp
+sudo dnf install freerdp netcat
 ```
 
 **Arch Linux:**
 ```bash
-sudo pacman -S freerdp
+sudo pacman -S freerdp gnu-netcat
 ```
 
 ## Installation
@@ -114,7 +120,7 @@ After global installation, you should be able to run:
 cd /tmp
 winrdp 192.168.1.100 username password
 
-# Check version/help
+# Check help
 winrdp --help
 ```
 
@@ -138,6 +144,7 @@ winrdp [IP[:PORT]] [USERNAME] [PASSWORD] [OPTIONS]
 - `--audio`: Enable audio and microphone redirection
 - `--multimon`: Enable multi-monitor support
 - `--verbose`: Enable debug logging to system logger
+- `--help, -h`: Show help message and exit
 
 ### Usage Examples
 
@@ -171,15 +178,71 @@ winrdp 192.168.1.100 username password --multimon --verbose
 winrdp 10.0.0.50:3391 admin@company.local MySecurePass123 --audio --multimon --verbose
 ```
 
+**Get help:**
+```bash
+winrdp --help
+```
+
+## Input Validation & Error Handling
+
+The script performs comprehensive validation of all inputs:
+
+### **Host Validation**
+- **IP Address Format**: Validates IPv4 format and octet ranges (0-255)
+- **Hostname Format**: Validates FQDN format and length restrictions
+- **Port Range**: Ensures ports are within valid range (1-65535)
+- **Connectivity Testing**: Verifies host is reachable on specified port
+
+### **Credential Validation**
+- **Pre-connection Testing**: Tests authentication before launching GUI
+- **Timeout Protection**: 15-second timeout for credential testing
+
+### **Retry Logic**
+- **Unified Re-entry**: Any validation failure requires re-entering ALL inputs
+- **Maximum Attempts**: 3 attempts before giving up
+- **Clear Error Messages**: Detailed feedback with troubleshooting guidance
+
+### **Example Error Scenarios**
+
+**Invalid IP Address:**
+```bash
+$ winrdp 999.999.999.999 admin password
+ERROR: Invalid IP address or hostname format: 999.999.999.999
+Input validation failed. (Attempt 2/3)
+Please re-enter all connection details:
+
+Enter destination IP/hostname (or IP:PORT): 192.168.1.100
+Enter username: admin
+Enter password: [hidden]
+```
+
+**Unreachable Host:**
+```bash
+$ winrdp 192.168.1.99 admin password
+ERROR: Cannot connect to 192.168.1.99:3389
+  - Check if the host is reachable
+  - Verify the IP address/hostname is correct
+  - Ensure RDP service is running on port 3389
+```
+
+**Authentication Failure:**
+```bash
+$ winrdp 192.168.1.100 wronguser password
+ERROR: Authentication failed with provided credentials
+Input validation failed. (Attempt 2/3)
+Please re-enter all connection details:
+```
+
 ## Configuration
 
 The script uses the following xfreerdp parameters by default:
 - Dynamic resolution adjustment
-- Graphics acceleration (GFX)
+- Graphics acceleration (GFX with progressive and small cache)
 - Clipboard sharing
 - Auto-reconnect (3 retries)
 - Certificate ignore
-- Optimized compression
+- Optimized compression (level 2)
+- Disabled themes and wallpaper for performance
 
 ## Monitoring and Debugging
 
@@ -233,21 +296,30 @@ Cannot connect to display
 
 **3. Connection refused**
 ```
-Connection refused
+ERROR: Cannot connect to [host]:[port]
 ```
 **Solution**: 
-- Verify the target IP/port
+- Verify the target IP/hostname and port
 - Check if RDP is enabled on the target machine
 - Verify firewall settings
+- Ensure the host is reachable
 
 **4. Authentication failures**
 ```
-Authentication failure
+ERROR: Authentication failed with provided credentials
 ```
 **Solution**:
-- Verify username/password
-- Check domain requirements
-- Ensure RDP permissions on target machine
+- Verify username/password are correct
+- Check domain requirements (use domain\username or user@domain format)
+- Ensure RDP permissions are granted on target machine
+- Verify account is not locked or disabled
+
+**5. Invalid input formats**
+```
+ERROR: Invalid IP address or hostname format
+ERROR: Invalid port number (must be 1-65535)
+```
+**Solution**: Follow the format guidelines and retry with correct input.
 
 ### Debug Mode
 
@@ -261,17 +333,48 @@ Then monitor the logs:
 sudo journalctl -t winrdp -f
 ```
 
+### Connectivity Testing Tools
+
+The script automatically detects and uses available connectivity testing tools:
+- **netcat (nc)**: Primary method - fast and reliable
+- **telnet**: Fallback method if netcat unavailable
+- **bash TCP redirection**: Built-in fallback (always available)
+
+Install recommended tools:
+```bash
+# Ubuntu/Debian
+sudo apt install netcat-openbsd telnet
+
+# RHEL/Fedora
+sudo dnf install netcat telnet
+
+# Arch Linux
+sudo pacman -S gnu-netcat inetutils
+```
+
 ## Security Considerations
 
-- **Password Storage**: Passwords are passed as command-line arguments (visible in process lists)
+- **Password Visibility**: Passwords passed as command-line arguments may be visible in process lists
 - **Certificate Validation**: Script automatically accepts untrusted certificates
 - **Network Security**: Uses standard RDP encryption
+- **Credential Testing**: Pre-validates credentials with minimal exposure
 
 ### Best Practices
 - Use domain authentication when possible
 - Run over VPN for external connections
-- Consider using SSH tunnels for additional security
+- Consider using SSH tunnels for additional security layer
 - Regularly update FreeRDP client
+- Use strong passwords and enable account lockout policies
+- Monitor connection logs for suspicious activity
+
+## Performance Optimization
+
+The script includes several performance optimizations:
+- **Graphics Acceleration**: GFX with progressive rendering
+- **Compression**: Level 2 compression for optimal balance
+- **Resource Management**: Disabled themes and wallpaper
+- **Small Cache**: Optimized for low-latency connections
+- **Dynamic Resolution**: Automatic resolution adjustment
 
 ## License
 
@@ -291,8 +394,19 @@ For issues and questions:
 - Check the [troubleshooting section](#troubleshooting)
 - Review system logs with `--verbose` option
 - Submit issues via GitHub Issues
+- Include debug logs when reporting problems
 
 ## Changelog
+
+### v2.0.0
+- Added unified retry logic requiring complete input re-entry
+- Added comprehensive input validation (IP, hostname, port, connectivity)
+- Added credential pre-validation before GUI launch
+- Added host connectivity testing with multiple fallback methods
+- Enhanced error messages with troubleshooting guidance
+- Added help system with usage examples
+- Improved debug logging and system integration
+- Replaced script self-calling with direct xfreerdp execution
 
 ### v1.0.0
 - Initial release
