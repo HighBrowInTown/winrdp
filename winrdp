@@ -1,0 +1,345 @@
+#!/bin/bash
+
+USE_AUDIO="0"
+USE_MULTIMON="0"
+VERBOSE="0"
+MAX_RETRIES=3
+
+# Display help message BEFORE argument parsing
+if [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
+    cat <<EOF
+Usage: winrdp [IP[:PORT]] [USERNAME] [PASSWORD] [OPTIONS]
+
+Options:
+  --audio      Enable audio and microphone redirection
+  --multimon   Enable multi-monitor support
+  --verbose    Enable debug logging to system logger
+  --help, -h   Show this help message and exit
+
+Examples:
+  winrdp 192.168.1.100 administrator password123
+  winrdp 192.168.1.100:3390 user@domain.com password --audio
+  winrdp --multimon --verbose
+  winrdp --help
+
+If any required parameter is missing, you will be prompted interactively.
+Default RDP port is 3389 if not specified.
+All output is logged to syslog under the 'winrdp' tag.
+EOF
+    exit 0
+fi
+
+# Parse command-line options first and remove them from $@
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --audio)
+            USE_AUDIO="1"
+            shift
+            ;;
+        --multimon)
+            USE_MULTIMON="1"
+            shift
+            ;;
+        --verbose)
+            VERBOSE="1"
+            shift
+            ;;
+        --help|-h)
+            show_help
+            exit 0
+            ;;
+        *)
+            POSITIONAL+=("$1")
+            shift
+            ;;
+    esac
+done
+set -- "${POSITIONAL[@]}"
+
+# Get initial user inputs
+DST_IP_PORT="${1}"
+USR_NAME="${2}"
+USR_PASSWD="${3}"
+
+# Function to validate IP address format
+validate_ip() {
+    local ip="$1"
+    local regex="^([0-9]{1,3}\.){3}[0-9]{1,3}$"
+    
+    if [[ $ip =~ $regex ]]; then
+        # Check each octet is <= 255
+        IFS='.' read -ra octets <<< "$ip"
+        for octet in "${octets[@]}"; do
+            if [[ $octet -gt 255 ]] || [[ $octet -lt 0 ]]; then
+                return 1
+            fi
+        done
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Function to validate hostname format
+validate_hostname() {
+    local hostname="$1"
+    local regex="^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$"
+    
+    [[ $hostname =~ $regex ]] && [[ ${#hostname} -le 253 ]]
+}
+
+# Function to test host connectivity
+test_host_connectivity() {
+    local host="$1"
+    local port="$2"
+    
+    debug "Testing connectivity to ${host}:${port}"
+    
+    # Method 1: Try netcat if available
+    if command -v nc >/dev/null 2>&1; then
+        if timeout 10s nc -z "$host" "$port" 2>/dev/null; then
+            debug "Host connectivity test successful (nc)"
+            return 0
+        fi
+    fi
+    
+    # Method 2: Try telnet if netcat not available
+    if command -v telnet >/dev/null 2>&1; then
+        if timeout 10s bash -c "echo '' | telnet $host $port" 2>/dev/null | grep -q "Connected"; then
+            debug "Host connectivity test successful (telnet)"
+            return 0
+        fi
+    fi
+    
+    # Method 3: Try bash built-in TCP redirection
+    if timeout 10s bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; then
+        exec 3<&-
+        exec 3>&-
+        debug "Host connectivity test successful (bash TCP)"
+        return 0
+    fi
+    
+    debug "Host connectivity test failed for ${host}:${port}"
+    return 1
+}
+
+# Function to test RDP connection without GUI
+test_rdp_connection() {
+    debug "Testing RDP connection to ${DST_IP_PORT} with user ${USR_NAME}"
+    
+    # Use xfreerdp in test mode (no GUI, just authentication test)
+    timeout 15s xfreerdp \
+        /v:"${DST_IP_PORT}" \
+        /u:"${USR_NAME}" \
+        /p:"${USR_PASSWD}" \
+        /cert:ignore \
+        +auth-only \
+        /log-level:ERROR \
+        >/dev/null 2>&1
+    
+    local exit_code=$?
+    
+    case $exit_code in
+        0)
+            debug "RDP connection test successful"
+            return 0
+            ;;
+        3|131)
+            debug "Authentication failed - invalid credentials"
+            return 1
+            ;;
+        124)
+            debug "RDP connection timeout"
+            return 1
+            ;;
+        *)
+            debug "RDP connection test failed with exit code: $exit_code"
+            return 1
+            ;;
+    esac
+}
+
+# Function to get all inputs from user
+get_all_inputs() {
+    local attempt_msg="$1"
+    
+    if [[ -n "$attempt_msg" ]]; then
+        echo "$attempt_msg"
+        echo "Please re-enter all connection details:"
+        echo
+    fi
+    
+    # Get host/IP
+    read -rp "Enter destination IP/hostname (or IP:PORT): " DST_IP_PORT
+    
+    # Parse IP and PORT, set default port if not specified
+    if [[ "$DST_IP_PORT" == *:* ]]; then
+        IP="${DST_IP_PORT%%:*}"
+        PORT="${DST_IP_PORT#*:}"
+    else
+        IP="$DST_IP_PORT"
+        PORT="3389"
+        DST_IP_PORT="${IP}:${PORT}"
+    fi
+    
+    # Get username
+    read -rp "Enter username: " USR_NAME
+    
+    # Get password
+    read -rsp "Enter password: " USR_PASSWD
+    echo
+}
+
+# Function to validate all inputs with complete retry logic
+validate_all_inputs() {
+    local retry_count=0
+    
+    # Initial input collection (if missing command line args)
+    if [[ -z "$DST_IP_PORT" || -z "$USR_NAME" || -z "$USR_PASSWD" ]]; then
+        get_all_inputs
+    else
+        # Parse provided DST_IP_PORT
+        if [[ "$DST_IP_PORT" == *:* ]]; then
+            IP="${DST_IP_PORT%%:*}"
+            PORT="${DST_IP_PORT#*:}"
+        else
+            IP="$DST_IP_PORT"
+            PORT="3389"
+            DST_IP_PORT="${IP}:${PORT}"
+        fi
+    fi
+    
+    # Validation loop
+    while [[ $retry_count -lt $MAX_RETRIES ]]; do
+        local validation_failed=false
+        local error_msg=""
+        
+        # Validate port number
+        if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [[ "$PORT" -lt 1 ]] || [[ "$PORT" -gt 65535 ]]; then
+            error_msg="ERROR: Invalid port number: $PORT (must be 1-65535)"
+            validation_failed=true
+        fi
+        
+        # Validate IP/hostname format
+        if [[ "$validation_failed" == false ]] && ! validate_ip "$IP" && ! validate_hostname "$IP"; then
+            error_msg="ERROR: Invalid IP address or hostname format: $IP"
+            validation_failed=true
+        fi
+        
+        # Test host connectivity
+        if [[ "$validation_failed" == false ]] && ! test_host_connectivity "$IP" "$PORT"; then
+            error_msg="ERROR: Cannot connect to $IP:$PORT"
+            echo "  - Check if the host is reachable"
+            echo "  - Verify the IP address/hostname is correct"
+            echo "  - Ensure RDP service is running on port $PORT"
+            validation_failed=true
+        fi
+        
+        # Test RDP credentials
+        if [[ "$validation_failed" == false ]] && ! test_rdp_connection; then
+            error_msg="ERROR: Authentication failed with provided credentials"
+            validation_failed=true
+        fi
+        
+        # If all validations passed
+        if [[ "$validation_failed" == false ]]; then
+            debug "All input validation successful"
+            return 0
+        fi
+        
+        # Handle validation failure
+        echo "$error_msg" >&2
+        debug "Input validation failed: $error_msg"
+        ((retry_count++))
+        
+        if [[ $retry_count -ge $MAX_RETRIES ]]; then
+            echo "ERROR: Maximum validation attempts exceeded ($MAX_RETRIES)" >&2
+            debug "ERROR: Maximum validation attempts exceeded"
+            return 1
+        fi
+        
+        # Get all inputs again for next attempt
+        get_all_inputs "Input validation failed. (Attempt $((retry_count + 1))/$MAX_RETRIES)"
+    done
+    
+    return 1
+}
+
+# Set required environment variables
+export DISPLAY="${DISPLAY:-:0}"
+export PATH="/usr/bin:/bin:/usr/local/bin:$PATH"
+
+# Debug print function - using logger
+debug() {
+    if [ "$VERBOSE" == "1" ]; then
+        logger -t winrdp "[DEBUG] $*"
+    fi
+}
+
+DO_RDP () {
+    # Validate all inputs with complete retry
+    if ! validate_all_inputs; then
+        return 1
+    fi
+    
+    # Final validation
+    if [[ -z "$DST_IP_PORT" || -z "$USR_NAME" || -z "$USR_PASSWD" ]]; then
+        debug "ERROR: Missing required parameters after validation"
+        echo "ERROR: Missing required parameters" >&2
+        return 1
+    fi
+    
+    # Check if xfreerdp is available
+    if ! command -v xfreerdp >/dev/null 2>&1; then
+        debug "ERROR: xfreerdp not found in PATH"
+        echo "ERROR: xfreerdp not found. Please install freerdp package." >&2
+        return 1
+    fi
+    
+    EXEC=(xfreerdp)
+    EXEC+=(/u:"${USR_NAME}")
+    EXEC+=(/p:"${USR_PASSWD}")
+    EXEC+=(/v:"${DST_IP_PORT}")
+    EXEC+=(/wm-class:RDP)
+    EXEC+=(/dynamic-resolution)
+    EXEC+=(/gfx)
+    EXEC+=(+gfx-progressive)
+    EXEC+=(+gfx-small-cache)
+    EXEC+=(/compression-level:2)
+    EXEC+=(/log-level:ERROR)
+    EXEC+=(/clipboard)
+    
+    # Add audio options
+    if [ "${USE_AUDIO}" == "1" ]; then
+        EXEC+=(/audio)
+        EXEC+=(/microphone)
+    fi
+    
+    # Add multimonitor support
+    [ "${USE_MULTIMON}" == "1" ] && EXEC+=(/multimon)
+    
+    EXEC+=(+auto-reconnect)
+    EXEC+=(/auto-reconnect-max-retries:3)
+    EXEC+=(-themes)
+    EXEC+=(-wallpaper)
+    EXEC+=(/cert:ignore)
+    
+    debug "Running: ${EXEC[*]}"
+    
+    # Use nohup directly with xfreerdp
+    nohup "${EXEC[@]}" >/dev/null 2>&1 &
+    RDP_PID=$!
+    
+    echo "RDP connection Established (PID: $RDP_PID)"
+    debug "xfreerdp started with PID: $RDP_PID"
+    
+    return 0
+}
+
+MAIN () {
+    debug "Starting WinRDP with parameters: USE_AUDIO=${USE_AUDIO}, USE_MULTIMON=${USE_MULTIMON}, VERBOSE=${VERBOSE}"
+    DO_RDP
+}
+
+MAIN "$@"
